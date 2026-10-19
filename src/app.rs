@@ -8,7 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::cli::Command;
-use crate::delete::{DeleteError, Failure, force_delete, is_protected};
+use crate::delete::{DeleteError, Failure, force_delete, is_protected, resolve_target};
 use crate::locks::LockingProcess;
 
 /// `ERROR_CANCELLED`: the user declined the UAC prompt.
@@ -58,8 +58,13 @@ pub trait System {
 pub fn run(cmd: Command, ui: &mut dyn Ui, sys: &mut dyn System) -> i32 {
     match cmd {
         Command::Menu => run_menu(ui, sys),
-        Command::Delete(paths) => exit_code(delete_flow(&paths, true, ui, sys)),
-        Command::ElevatedDelete(paths) => exit_code(delete_flow(&paths, false, ui, sys)),
+        Command::Delete(paths) => exit_code(delete_flow(&paths, false, ui, sys)),
+        Command::ElevatedDelete(paths) => {
+            // The parent already got consent, but only a really elevated
+            // process may rely on it.
+            let consented = sys.is_elevated();
+            exit_code(delete_flow(&paths, consented, ui, sys))
+        }
         Command::Install => install(ui, sys),
         Command::Uninstall => uninstall(ui, sys),
     }
@@ -78,7 +83,7 @@ fn run_menu(ui: &mut dyn Ui, sys: &mut dyn System) -> i32 {
         return 0;
     };
     let paths = [path];
-    match delete_flow(&paths, true, ui, sys) {
+    match delete_flow(&paths, false, ui, sys) {
         Flow::Deleted | Flow::Elevated(0) => {
             ui.info(&format!("Fckn deleted:\n{}", paths[0].display()));
             0
@@ -167,11 +172,13 @@ impl Target {
     }
 }
 
-fn delete_flow(paths: &[PathBuf], confirm: bool, ui: &mut dyn Ui, sys: &mut dyn System) -> Flow {
+/// `consented`: the user already confirmed the delete and any elevation
+/// (an elevated child), so no dialog is shown for either.
+fn delete_flow(paths: &[PathBuf], consented: bool, ui: &mut dyn Ui, sys: &mut dyn System) -> Flow {
     if paths.is_empty() {
         return Flow::Cancelled;
     }
-    if confirm {
+    if !consented {
         let proceed = if paths.iter().any(|p| is_protected(p)) {
             ui.confirm_protected(paths)
         } else {
@@ -184,10 +191,16 @@ fn delete_flow(paths: &[PathBuf], confirm: bool, ui: &mut dyn Ui, sys: &mut dyn 
 
     let mut targets: Vec<Target> = paths.iter().map(|p| Target::attempt(p)).collect();
     close_lockers(&mut targets, ui, sys);
-    if let Some(flow) = resolve_access_denied(&mut targets, paths, ui, sys) {
+    if let Some(flow) = resolve_access_denied(&mut targets, paths, consented, ui, sys) {
         return flow;
     }
     report(&targets, ui)
+}
+
+/// A failure that a running process may be causing. A running exe or loaded
+/// DLL fails with "access denied" rather than a sharing violation.
+fn may_be_locked(failure: &Failure) -> bool {
+    failure.is_locked() || failure.is_access_denied()
 }
 
 /// Offers to terminate the processes holding failed items open, then retries
@@ -196,7 +209,7 @@ fn close_lockers(targets: &mut [Target], ui: &mut dyn Ui, sys: &mut dyn System) 
     let locked: Vec<PathBuf> = targets
         .iter()
         .flat_map(Target::failures)
-        .filter(|f| f.is_locked())
+        .filter(|f| may_be_locked(f))
         // Restart Manager may not match `\\?\` verbatim paths.
         .map(|f| PathBuf::from(display_path(&f.path)))
         .collect();
@@ -211,12 +224,21 @@ fn close_lockers(targets: &mut [Target], ui: &mut dyn Ui, sys: &mut dyn System) 
         // A process that survives shows up as a failure on the retry below.
         let _ = sys.kill(locker.pid);
     }
-    for target in targets
-        .iter_mut()
-        .filter(|t| t.has_failure(Failure::is_locked))
-    {
+    for target in targets.iter_mut().filter(|t| t.has_failure(may_be_locked)) {
         target.retry();
     }
+}
+
+/// The roots that still exist, each as an absolute path that means the same
+/// thing in any process: the canonical parent joined with the final
+/// component. The final component is never resolved, so links are not
+/// followed; mapped drives become `\\?\UNC\...`.
+pub fn existing_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    roots
+        .iter()
+        .filter_map(|p| resolve_target(p).ok())
+        .filter(|p| fs::symlink_metadata(p).is_ok())
+        .collect()
 }
 
 /// Handles items that still fail with "access denied": takes ownership
@@ -225,6 +247,7 @@ fn close_lockers(targets: &mut [Target], ui: &mut dyn Ui, sys: &mut dyn System) 
 fn resolve_access_denied(
     targets: &mut [Target],
     roots: &[PathBuf],
+    consented: bool,
     ui: &mut dyn Ui,
     sys: &mut dyn System,
 ) -> Option<Flow> {
@@ -235,7 +258,21 @@ fn resolve_access_denied(
         return None;
     }
 
+    // Never relaunch (or ask) with nothing to act on: a bare `--elevated`
+    // would start the menu.
+    let existing = existing_roots(roots);
+    if existing.is_empty() {
+        return None;
+    }
+    let shown: Vec<PathBuf> = existing
+        .iter()
+        .map(|p| PathBuf::from(display_path(p)))
+        .collect();
+
     if sys.is_elevated() {
+        if !consented && !ui.confirm_elevate(&shown) {
+            return None;
+        }
         for target in targets
             .iter_mut()
             .filter(|t| t.has_failure(Failure::is_access_denied))
@@ -255,12 +292,7 @@ fn resolve_access_denied(
         return None;
     }
 
-    let existing: Vec<PathBuf> = roots
-        .iter()
-        .filter(|p| fs::symlink_metadata(p).is_ok())
-        .cloned()
-        .collect();
-    if !ui.confirm_elevate(&existing) {
+    if !ui.confirm_elevate(&shown) {
         return None;
     }
     match sys.relaunch_elevated(&existing) {

@@ -24,7 +24,7 @@ use windows::Win32::Security::{
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileAttributeTagInfo, GetFileInformationByHandleEx, OPEN_EXISTING, READ_CONTROL,
+    FileAttributeTagInfo, GetFileInformationByHandleEx, OPEN_EXISTING,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcessToken, WaitForSingleObject,
@@ -385,7 +385,8 @@ pub fn take_ownership_tree(path: &Path) -> Vec<(PathBuf, io::Error)> {
 
 /// Owner first (the take-ownership privilege grants `WRITE_OWNER` even when
 /// the DACL denies everything), then the DACL through a second handle: as
-/// the new owner we hold `WRITE_DAC` and `READ_CONTROL` implicitly.
+/// the new owner we hold `WRITE_DAC` implicitly. (`READ_CONTROL` is not
+/// requested: the restore privilege grants `WRITE_DAC` but not that.)
 fn fix_security(wide: &[u16], admins: &Admins) -> io::Result<()> {
     let handle = open_no_follow(wide, WRITE_OWNER)?;
     set_security(
@@ -396,7 +397,7 @@ fn fix_security(wide: &[u16], admins: &Admins) -> io::Result<()> {
     )?;
     drop(handle);
 
-    let handle = open_no_follow(wide, WRITE_DAC | READ_CONTROL.0)?;
+    let handle = open_no_follow(wide, WRITE_DAC)?;
     set_security(
         &handle,
         DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,

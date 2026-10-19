@@ -4,7 +4,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 
-use fckn_delete::app::{MenuChoice, System, Ui, run};
+use fckn_delete::app::{MenuChoice, System, Ui, display_path, existing_roots, run};
 use fckn_delete::cli::Command;
 use fckn_delete::locks::LockingProcess;
 
@@ -22,6 +22,8 @@ struct FakeUi {
     protected_calls: Vec<Vec<PathBuf>>,
     kill_calls: Vec<Vec<LockingProcess>>,
     elevate_calls: Vec<Vec<PathBuf>>,
+    /// Order of the kill/elevate prompts.
+    events: Vec<&'static str>,
     infos: Vec<String>,
     errors: Vec<String>,
 }
@@ -41,6 +43,7 @@ impl FakeUi {
             protected_calls: Vec::new(),
             kill_calls: Vec::new(),
             elevate_calls: Vec::new(),
+            events: Vec::new(),
             infos: Vec::new(),
             errors: Vec::new(),
         }
@@ -74,10 +77,12 @@ impl Ui for FakeUi {
         self.confirm_protected
     }
     fn confirm_kill(&mut self, procs: &[LockingProcess]) -> bool {
+        self.events.push("kill");
         self.kill_calls.push(procs.to_vec());
         self.confirm_kill
     }
     fn confirm_elevate(&mut self, paths: &[PathBuf]) -> bool {
+        self.events.push("elevate");
         self.elevate_calls.push(paths.to_vec());
         self.confirm_elevate
     }
@@ -96,6 +101,8 @@ struct FakeSystem {
     held: Option<File>,
     /// Whether `kill` releases `held` (a stubborn process does not).
     kill_frees_file: bool,
+    /// Paths whose ACLs `kill` resets (a process that blocked them is gone).
+    kill_resets: Vec<PathBuf>,
     /// Raw OS error to fail `relaunch_elevated` with, else exit code 0.
     relaunch_error: Option<i32>,
 
@@ -115,6 +122,7 @@ impl FakeSystem {
             lockers: Vec::new(),
             held: None,
             kill_frees_file: true,
+            kill_resets: Vec::new(),
             relaunch_error: None,
             installs: 0,
             uninstalls: 0,
@@ -147,6 +155,9 @@ impl System for FakeSystem {
         if self.kill_frees_file {
             self.held = None;
         }
+        for path in &self.kill_resets {
+            assert!(icacls_reset(path), "icacls /reset failed for {path:?}");
+        }
         Ok(())
     }
     fn is_elevated(&self) -> bool {
@@ -168,6 +179,22 @@ impl System for FakeSystem {
         }
         Vec::new()
     }
+}
+
+/// What the app should hand a relaunched child for `root`: canonical parent
+/// joined with the final component.
+fn resolved_form(root: &Path) -> PathBuf {
+    let name = root.file_name().unwrap();
+    let parent = match root.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    fs::canonicalize(parent).unwrap().join(name)
+}
+
+/// The dialog form of a resolved path (no `\\?\` prefix).
+fn plain(path: &Path) -> PathBuf {
+    PathBuf::from(display_path(path))
 }
 
 fn icacls_reset(path: &Path) -> bool {
@@ -499,8 +526,11 @@ fn access_denied_not_elevated_relaunches() {
         run(Command::Delete(vec![root.clone()]), &mut ui, &mut sys),
         0
     );
-    assert_eq!(ui.elevate_calls, vec![vec![root.clone()]]);
-    assert_eq!(sys.relaunches, vec![vec![root]]);
+    // The dialog shows the plain absolute path; the child gets the stable
+    // `\\?\` form (canonical parent + final component).
+    let resolved = resolved_form(&root);
+    assert_eq!(ui.elevate_calls, vec![vec![plain(&resolved)]]);
+    assert_eq!(sys.relaunches, vec![vec![resolved]]);
     assert!(sys.ownership.is_empty());
     assert!(ui.errors.is_empty());
     assert!(ui.infos.is_empty());
@@ -581,6 +611,7 @@ fn access_denied_elevated_takes_ownership() {
     let dir = tempfile::tempdir().unwrap();
     let (root, file, _guard) = denied_file(dir.path());
     let mut ui = FakeUi::new();
+    ui.confirm_elevate = true;
     let mut sys = FakeSystem::new();
     sys.elevated = true;
     assert_eq!(
@@ -589,11 +620,173 @@ fn access_denied_elevated_takes_ownership() {
     );
     assert_eq!(sys.ownership.len(), 1);
     assert!(sys.ownership[0].ends_with("f.txt"));
-    assert!(ui.elevate_calls.is_empty());
+    assert_eq!(ui.elevate_calls.len(), 1);
     assert!(sys.relaunches.is_empty());
     assert!(ui.errors.is_empty());
     assert!(!file.exists());
     assert!(!root.exists());
+}
+
+#[test]
+fn access_denied_elevated_decline_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, file, _guard) = denied_file(dir.path());
+    let mut ui = FakeUi::new();
+    ui.confirm_elevate = false;
+    let mut sys = FakeSystem::new();
+    sys.elevated = true;
+    assert_eq!(run(Command::Delete(vec![root]), &mut ui, &mut sys), 1);
+    assert_eq!(ui.elevate_calls.len(), 1);
+    assert!(sys.ownership.is_empty());
+    assert!(sys.relaunches.is_empty());
+    assert_eq!(ui.errors.len(), 1);
+    assert!(file.exists());
+}
+
+#[test]
+fn elevated_delete_when_elevated_takes_ownership_without_asking() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, file, _guard) = denied_file(dir.path());
+    let mut ui = FakeUi::new();
+    let mut sys = FakeSystem::new();
+    sys.elevated = true;
+    assert_eq!(
+        run(Command::ElevatedDelete(vec![root]), &mut ui, &mut sys),
+        0
+    );
+    assert_eq!(sys.ownership.len(), 1);
+    assert!(ui.no_confirmations_asked());
+    assert!(ui.errors.is_empty());
+    assert!(!file.exists());
+}
+
+#[test]
+fn elevated_delete_when_not_elevated_still_confirms() {
+    let (_dir, f) = temp_file();
+    let mut ui = FakeUi::new();
+    ui.confirm_delete = false;
+    let mut sys = FakeSystem::new();
+    assert_eq!(
+        run(Command::ElevatedDelete(vec![f.clone()]), &mut ui, &mut sys),
+        0
+    );
+    assert!(f.exists());
+    assert_eq!(ui.delete_calls.len(), 1);
+
+    let mut ui = FakeUi::new();
+    ui.confirm_protected = false;
+    let root = PathBuf::from(r"C:\");
+    assert_eq!(
+        run(
+            Command::ElevatedDelete(vec![root.clone()]),
+            &mut ui,
+            &mut sys
+        ),
+        0
+    );
+    assert_eq!(ui.protected_calls, vec![vec![root]]);
+    assert!(ui.delete_calls.is_empty());
+}
+
+#[test]
+fn relaunch_gets_absolute_paths_for_relative_roots() {
+    // A relative path is only meaningful in this process's cwd, so the
+    // elevated child must receive an absolute form.
+    let dir = tempfile::Builder::new()
+        .prefix("rel-")
+        .tempdir_in("target")
+        .unwrap();
+    let relative_base = PathBuf::from("target").join(dir.path().file_name().unwrap());
+    assert!(!relative_base.is_absolute());
+    let (root, _file, _guard) = denied_file(&relative_base);
+    assert!(!root.is_absolute());
+
+    let mut ui = FakeUi::new();
+    ui.confirm_elevate = true;
+    let mut sys = FakeSystem::new();
+    assert_eq!(
+        run(Command::Delete(vec![root.clone()]), &mut ui, &mut sys),
+        0
+    );
+    assert_eq!(sys.relaunches.len(), 1);
+    assert_eq!(sys.relaunches[0], vec![resolved_form(&root)]);
+    assert!(sys.relaunches[0][0].is_absolute());
+    assert!(ui.elevate_calls[0][0].is_absolute());
+    assert!(
+        !ui.elevate_calls[0][0]
+            .to_string_lossy()
+            .starts_with(r"\\?\")
+    );
+}
+
+#[test]
+fn existing_roots_resolves_and_skips_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let there = dir.path().join("there.txt");
+    fs::write(&there, "x").unwrap();
+    let missing = dir.path().join("missing.txt");
+    let roots = existing_roots(&[missing, there.clone()]);
+    assert_eq!(roots, vec![resolved_form(&there)]);
+    assert!(existing_roots(&[dir.path().join("nope")]).is_empty());
+}
+
+#[test]
+fn access_denied_with_lockers_asks_to_kill_before_elevating() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, file, _guard) = denied_file(dir.path());
+    let mut ui = FakeUi::new();
+    ui.confirm_kill = true;
+    ui.confirm_elevate = true;
+    let mut sys = FakeSystem::new();
+    // The "process" holds the item but killing it does not fix the ACLs.
+    sys.lockers = vec![LockingProcess {
+        pid: 42,
+        name: "x".to_string(),
+    }];
+    assert_eq!(run(Command::Delete(vec![root]), &mut ui, &mut sys), 0);
+    assert_eq!(ui.events, vec!["kill", "elevate"]);
+    assert_eq!(sys.killed, vec![42]);
+    assert_eq!(sys.locker_queries.len(), 1);
+    assert_eq!(sys.relaunches.len(), 1);
+    assert!(file.exists());
+}
+
+#[test]
+fn access_denied_freed_by_kill_skips_elevation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, file, _guard) = denied_file(dir.path());
+    let mut ui = FakeUi::new();
+    ui.confirm_kill = true;
+    ui.confirm_elevate = true;
+    let mut sys = FakeSystem::new();
+    sys.lockers = vec![LockingProcess {
+        pid: 42,
+        name: "x".to_string(),
+    }];
+    // Killing the process releases the item (modelled by resetting the ACLs).
+    sys.kill_resets = vec![file.clone(), root.clone()];
+    assert_eq!(
+        run(Command::Delete(vec![root.clone()]), &mut ui, &mut sys),
+        0
+    );
+    assert_eq!(ui.events, vec!["kill"]);
+    assert!(sys.relaunches.is_empty());
+    assert!(ui.errors.is_empty());
+    assert!(!file.exists());
+    assert!(!root.exists());
+}
+
+#[test]
+fn access_denied_without_lockers_goes_straight_to_elevation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _file, _guard) = denied_file(dir.path());
+    let mut ui = FakeUi::new();
+    ui.confirm_kill = true;
+    ui.confirm_elevate = false;
+    let mut sys = FakeSystem::new();
+    assert_eq!(run(Command::Delete(vec![root]), &mut ui, &mut sys), 1);
+    assert_eq!(ui.events, vec!["elevate"]);
+    assert_eq!(sys.locker_queries.len(), 1);
 }
 
 #[test]
@@ -603,6 +796,7 @@ fn elevated_delete_skips_confirm() {
     ui.confirm_delete = false;
     ui.confirm_protected = false;
     let mut sys = FakeSystem::new();
+    sys.elevated = true;
     assert_eq!(
         run(Command::ElevatedDelete(vec![f.clone()]), &mut ui, &mut sys),
         0

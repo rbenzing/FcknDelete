@@ -72,7 +72,7 @@ impl std::error::Error for DeleteError {}
 
 /// Absolute `\\?\` form of `path`. The final component is deliberately not
 /// resolved, so a link given as the target is deleted itself, never its target.
-fn resolve_target(path: &Path) -> io::Result<PathBuf> {
+pub fn resolve_target(path: &Path) -> io::Result<PathBuf> {
     match (path.parent(), path.file_name()) {
         (Some(parent), Some(name)) => {
             let parent = if parent.as_os_str().is_empty() {
