@@ -3,13 +3,16 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 use fckn_delete::elevate::{is_elevated, quote_args, take_ownership_tree};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID, LocalFree};
-use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LUID, LocalFree};
+use windows::Win32::Security::Authorization::{
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    SetNamedSecurityInfoW,
+};
 use windows::Win32::Security::{
     ACL, AdjustTokenPrivileges, CreateWellKnownSid, DACL_SECURITY_INFORMATION, InitializeAcl,
     LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES,
-    TOKEN_PRIVILEGES, TOKEN_QUERY, WinLocalSystemSid,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_PRIVILEGE_ENABLED,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY, WinLocalSystemSid,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::UI::Shell::CommandLineToArgvW;
@@ -157,6 +160,46 @@ fn enable(name: PCWSTR) {
     }
 }
 
+/// Owner + DACL of `path` as an SDDL string.
+fn sddl(path: &Path) -> String {
+    let wpath = wide(path);
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `wpath` is NUL-terminated and `psd` a valid out pointer.
+    unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(wpath.as_ptr()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            &mut psd,
+        )
+        .ok()
+        .unwrap();
+    }
+    let mut out = PWSTR::null();
+    // SAFETY: `psd` was returned by GetNamedSecurityInfoW; `out` is a valid out pointer.
+    unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            psd,
+            1,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut out,
+            None,
+        )
+        .unwrap();
+    }
+    // SAFETY: `out` is a NUL-terminated string allocated with LocalAlloc, as is `psd`.
+    let text = unsafe { out.to_string() }.unwrap();
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(out.0.cast())));
+        let _ = LocalFree(Some(HLOCAL(psd.0)));
+    }
+    text
+}
+
 /// Restores access to the tree on drop so the tempdir can always be removed.
 struct Restore<'a>(&'a Path);
 
@@ -180,6 +223,22 @@ fn take_ownership_then_delete_locked_down_tree() {
     std::fs::create_dir_all(&sub).unwrap();
     std::fs::write(&file, b"x").unwrap();
 
+    // A junction inside the tree pointing outside it: the walk must treat the
+    // link itself and leave the target's security and contents alone.
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("keep.txt"), b"keep").unwrap();
+    let status = std::process::Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(root.join("link"))
+        .arg(&outside)
+        .output()
+        .unwrap()
+        .status;
+    assert!(status.success(), "mklink /J failed");
+    let outside_before = sddl(&outside);
+    let keep_before = sddl(&outside.join("keep.txt"));
+
     let _restore = Restore(&root);
     // Bottom-up, so each parent is still accessible while its child is locked.
     for p in [&file, &sub, &root] {
@@ -193,4 +252,12 @@ fn take_ownership_then_delete_locked_down_tree() {
     let failures = take_ownership_tree(&root);
     assert!(failures.is_empty(), "failures: {failures:?}");
     std::fs::remove_dir_all(&root).unwrap();
+
+    assert_eq!(
+        sddl(&outside),
+        outside_before,
+        "junction target was changed"
+    );
+    assert_eq!(sddl(&outside.join("keep.txt")), keep_before);
+    assert_eq!(std::fs::read(outside.join("keep.txt")).unwrap(), b"keep");
 }

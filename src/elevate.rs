@@ -6,23 +6,25 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{
-    CloseHandle, GENERIC_ALL, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LUID, LocalFree, WAIT_FAILED,
-    WIN32_ERROR,
+    CloseHandle, GENERIC_ALL, HANDLE, HLOCAL, LUID, LocalFree, WAIT_FAILED, WIN32_ERROR,
 };
 use windows::Win32::Security::Authorization::{
-    EXPLICIT_ACCESS_W, GRANT_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW,
-    SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
+    EXPLICIT_ACCESS_W, GRANT_ACCESS, SetEntriesInAclW, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP,
+    TRUSTEE_W,
 };
 use windows::Win32::Security::{
     ACL, AdjustTokenPrivileges, CreateWellKnownSid, DACL_SECURITY_INFORMATION, GetTokenInformation,
-    LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, OBJECT_SECURITY_INFORMATION,
-    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_PRIVILEGE_ENABLED,
-    SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_ADJUST_PRIVILEGES, TOKEN_ELEVATION, TOKEN_PRIVILEGES,
-    TOKEN_QUERY, TokenElevation, WinBuiltinAdministratorsSid,
+    InitializeSecurityDescriptor, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
+    OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED, SECURITY_DESCRIPTOR,
+    SUB_CONTAINERS_AND_OBJECTS_INHERIT, SetKernelObjectSecurity, SetSecurityDescriptorControl,
+    SetSecurityDescriptorDacl, SetSecurityDescriptorOwner, TOKEN_ADJUST_PRIVILEGES,
+    TOKEN_ELEVATION, TOKEN_PRIVILEGES, TOKEN_QUERY, TokenElevation, WinBuiltinAdministratorsSid,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FindClose, FindFirstFileW, OPEN_EXISTING, WIN32_FIND_DATAW,
+    CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FileAttributeTagInfo, GetFileInformationByHandleEx, OPEN_EXISTING, READ_CONTROL,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcessToken, WaitForSingleObject,
@@ -118,6 +120,18 @@ fn wide_z(s: &OsStr) -> Vec<u16> {
     s.encode_wide().chain(Some(0)).collect()
 }
 
+/// Converts a `windows` error into an `io::Error` carrying the plain Win32
+/// code (`raw_os_error() == Some(5)` for access denied). The crate's own
+/// `From` impl would keep the `0x8007xxxx` HRESULT form.
+fn win_err(e: windows::core::Error) -> io::Error {
+    let code = e.code().0 as u32;
+    if code & 0xFFFF_0000 == 0x8007_0000 {
+        io::Error::from_raw_os_error((code & 0xFFFF) as i32)
+    } else {
+        io::Error::other(e)
+    }
+}
+
 /// Relaunches this exe with `args` through UAC (`runas`), waits for it and
 /// returns its exit code. A declined UAC prompt is an `Err` whose
 /// `raw_os_error()` is `Some(1223)` (`ERROR_CANCELLED`).
@@ -136,13 +150,7 @@ pub fn relaunch_elevated(args: &[OsString]) -> io::Result<i32> {
     };
     // SAFETY: `info` is fully initialised and the strings it points to outlive the call.
     if let Err(e) = unsafe { ShellExecuteExW(&mut info) } {
-        // A Win32 error comes back as HRESULT_FROM_WIN32 (0x8007xxxx).
-        let code = e.code().0 as u32;
-        return Err(if code & 0xFFFF_0000 == 0x8007_0000 {
-            io::Error::from_raw_os_error((code & 0xFFFF) as i32)
-        } else {
-            io::Error::other(e)
-        });
+        return Err(win_err(e));
     }
     let process = info.hProcess;
     if process.is_invalid() {
@@ -159,7 +167,7 @@ pub fn relaunch_elevated(args: &[OsString]) -> io::Result<i32> {
             let mut code = 0u32;
             GetExitCodeProcess(process, &mut code)
                 .map(|()| code as i32)
-                .map_err(io::Error::from)
+                .map_err(win_err)
         }
     };
     // SAFETY: `process` is not used after this.
@@ -167,31 +175,32 @@ pub fn relaunch_elevated(args: &[OsString]) -> io::Result<i32> {
     result
 }
 
-/// Absolute `\\?\` form of `path`. The final component is not resolved, so a
-/// link is addressed itself, never its target.
+/// Absolute `\\?\` form of `path`, built on UTF-16 so unpaired surrogates
+/// survive. The final component is not resolved, so a link is addressed
+/// itself, never its target. A trailing separator is dropped (except on a
+/// drive root); paths that already start with `\\?\` or `\\.\` are untouched.
 fn long_path(path: &Path) -> io::Result<PathBuf> {
+    const BACKSLASH: u16 = b'\\' as u16;
     let abs = std::path::absolute(path)?;
-    let s = abs.as_os_str().to_string_lossy();
-    if s.starts_with(r"\\?\") {
+    let mut wide: Vec<u16> = abs.as_os_str().encode_wide().collect();
+    let starts_with = |prefix: &[u8]| {
+        wide.len() >= prefix.len() && wide.iter().zip(prefix).all(|(&a, &b)| a == u16::from(b))
+    };
+    if starts_with(br"\\?\") || starts_with(br"\\.\") {
         return Ok(abs);
     }
-    Ok(match s.strip_prefix(r"\\") {
-        Some(unc) => PathBuf::from(format!(r"\\?\UNC\{unc}")),
-        None => PathBuf::from(format!(r"\\?\{s}")),
-    })
-}
-
-/// Attributes and reparse tag of the entry itself, read from its directory
-/// entry so a locked-down item still answers.
-fn entry_info(path: &Path) -> io::Result<(u32, u32)> {
-    let wide = wide_z(path.as_os_str());
-    let mut data = WIN32_FIND_DATAW::default();
-    // SAFETY: `wide` is NUL-terminated and `data` is a valid out buffer.
-    let handle = unsafe { FindFirstFileW(PCWSTR(wide.as_ptr()), &mut data) }
-        .map_err(|_| io::Error::last_os_error())?;
-    // SAFETY: `handle` was returned by FindFirstFileW above.
-    let _ = unsafe { FindClose(handle) };
-    Ok((data.dwFileAttributes, data.dwReserved0))
+    while wide.len() > 3 && wide.last() == Some(&BACKSLASH) {
+        wide.pop();
+    }
+    let mut out: Vec<u16> = Vec::with_capacity(wide.len() + 8);
+    if wide.starts_with(&[BACKSLASH, BACKSLASH]) {
+        out.extend(r"\\?\UNC\".encode_utf16());
+        out.extend_from_slice(&wide[2..]);
+    } else {
+        out.extend(r"\\?\".encode_utf16());
+        out.extend_from_slice(&wide);
+    }
+    Ok(PathBuf::from(OsString::from_wide(&out)))
 }
 
 /// Enables `name` on the process token. Best effort: without the privilege
@@ -234,59 +243,68 @@ fn win32_result(status: WIN32_ERROR) -> io::Result<()> {
     }
 }
 
-/// Applies `info` (owner or DACL) to the object at `path`. A link is opened
-/// with `FILE_FLAG_OPEN_REPARSE_POINT` so its own security is changed, not
-/// its target's.
-fn set_security(
-    path: &Path,
-    is_link: bool,
-    info: OBJECT_SECURITY_INFORMATION,
-    owner: Option<PSID>,
-    dacl: Option<*const ACL>,
-) -> io::Result<()> {
-    let wide = wide_z(path.as_os_str());
-    if !is_link {
-        // SAFETY: `wide` is NUL-terminated; owner/dacl point to live buffers owned by the caller.
-        let status = unsafe {
-            SetNamedSecurityInfoW(
-                PCWSTR(wide.as_ptr()),
-                SE_FILE_OBJECT,
-                info,
-                owner,
-                None,
-                dacl,
-                None,
-            )
-        };
-        return win32_result(status);
-    }
+/// A file handle closed on drop.
+struct FileHandle(HANDLE);
 
-    let access = if info == OWNER_SECURITY_INFORMATION {
-        WRITE_OWNER
-    } else {
-        WRITE_DAC
-    };
-    // SAFETY: `wide` is NUL-terminated; the handle is closed below.
-    let handle = unsafe {
+impl Drop for FileHandle {
+    fn drop(&mut self) {
+        // SAFETY: the handle was returned by CreateFileW and is closed once.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// Share mode for every handle here: others may read and write, but nobody
+/// can rename or delete the object while we hold a handle with data access.
+const SHARE: FILE_SHARE_MODE = FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0);
+
+/// Opens the object at `wide` itself. `FILE_FLAG_OPEN_REPARSE_POINT` means a
+/// junction or symlink is opened as the link, never followed to its target;
+/// the backup flag allows directories and lets the take-ownership and
+/// restore privileges apply.
+fn open_no_follow(wide: &[u16], access: u32) -> io::Result<FileHandle> {
+    // SAFETY: `wide` is NUL-terminated and outlives the call.
+    unsafe {
         CreateFileW(
             PCWSTR(wide.as_ptr()),
             access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            SHARE,
             None,
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
             None,
         )
     }
-    .map_err(|_| io::Error::last_os_error())?;
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
+    .map(FileHandle)
+    .map_err(win_err)
+}
+
+/// Sets owner and/or DACL on the open object. `SetKernelObjectSecurity`
+/// writes exactly this object; unlike `SetNamedSecurityInfo`/`SetSecurityInfo`
+/// it does not propagate inheritable ACEs over the existing subtree (the walk
+/// fixes every item explicitly, so propagation would only cost O(n*depth)
+/// and could abort on unreadable children).
+fn set_security(
+    handle: &FileHandle,
+    info: OBJECT_SECURITY_INFORMATION,
+    owner: Option<PSID>,
+    dacl: Option<*const ACL>,
+) -> io::Result<()> {
+    let mut sd = SECURITY_DESCRIPTOR::default();
+    let psd = PSECURITY_DESCRIPTOR((&raw mut sd).cast());
+    // SAFETY: `psd` points at `sd`, a live SECURITY_DESCRIPTOR; the owner SID
+    // and ACL are kept alive by the caller for the duration of the calls.
+    unsafe {
+        InitializeSecurityDescriptor(psd, 1).map_err(win_err)?;
+        if owner.is_some() {
+            SetSecurityDescriptorOwner(psd, owner, false).map_err(win_err)?;
+        }
+        if dacl.is_some() {
+            SetSecurityDescriptorDacl(psd, true, dacl, false).map_err(win_err)?;
+            SetSecurityDescriptorControl(psd, SE_DACL_PROTECTED, SE_DACL_PROTECTED)
+                .map_err(win_err)?;
+        }
+        SetKernelObjectSecurity(handle.0, info, psd).map_err(win_err)
     }
-    // SAFETY: `handle` is a valid open handle; owner/dacl point to live buffers.
-    let status = unsafe { SetSecurityInfo(handle, SE_FILE_OBJECT, info, owner, None, dacl, None) };
-    // SAFETY: `handle` is not used after this.
-    let _ = unsafe { CloseHandle(handle) };
-    win32_result(status)
 }
 
 /// Frees a `LocalAlloc`ed pointer when dropped.
@@ -302,7 +320,7 @@ impl Drop for LocalGuard {
 }
 
 struct Admins {
-    /// Backing storage of the SID that `sid` points into.
+    /// Backing storage of the SID that `sid()` points into.
     sid_buf: Vec<u8>,
     acl: *mut ACL,
     _acl_guard: LocalGuard,
@@ -315,7 +333,7 @@ impl Admins {
         let sid = PSID(sid_buf.as_mut_ptr().cast());
         // SAFETY: `sid_buf` holds SECURITY_MAX_SID_SIZE bytes and `size` says so.
         unsafe { CreateWellKnownSid(WinBuiltinAdministratorsSid, None, Some(sid), &mut size) }
-            .map_err(|_| io::Error::last_os_error())?;
+            .map_err(win_err)?;
 
         let entry = EXPLICIT_ACCESS_W {
             grfAccessPermissions: GENERIC_ALL.0,
@@ -346,10 +364,10 @@ impl Admins {
 
 /// Takes ownership of `path` and everything below it: owner becomes
 /// BUILTIN\Administrators and the DACL is replaced by one ACE granting
-/// Administrators full control (inherited by children). Works top-down, so a
-/// directory is fixed before it is listed. Junctions and symlinks are fixed
-/// themselves but never descended. Failures are collected and the walk
-/// continues.
+/// Administrators full control (inherited by future children). Works
+/// top-down, so a directory is fixed before it is listed. Junctions and
+/// symlinks are fixed themselves but never descended. Failures are collected
+/// and the walk continues.
 pub fn take_ownership_tree(path: &Path) -> Vec<(PathBuf, io::Error)> {
     let mut failures = Vec::new();
     enable_privilege(w!("SeTakeOwnershipPrivilege"));
@@ -365,51 +383,131 @@ pub fn take_ownership_tree(path: &Path) -> Vec<(PathBuf, io::Error)> {
     failures
 }
 
+/// Owner first (the take-ownership privilege grants `WRITE_OWNER` even when
+/// the DACL denies everything), then the DACL through a second handle: as
+/// the new owner we hold `WRITE_DAC` and `READ_CONTROL` implicitly.
+fn fix_security(wide: &[u16], admins: &Admins) -> io::Result<()> {
+    let handle = open_no_follow(wide, WRITE_OWNER)?;
+    set_security(
+        &handle,
+        OWNER_SECURITY_INFORMATION,
+        Some(admins.sid()),
+        None,
+    )?;
+    drop(handle);
+
+    let handle = open_no_follow(wide, WRITE_DAC | READ_CONTROL.0)?;
+    set_security(
+        &handle,
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+        None,
+        Some(admins.acl.cast_const()),
+    )
+}
+
+/// Attributes and reparse tag of the object behind `handle`.
+fn attribute_tag(handle: &FileHandle) -> io::Result<(u32, u32)> {
+    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+    // SAFETY: the buffer pointer and size describe `info`; `handle` is open.
+    unsafe {
+        GetFileInformationByHandleEx(
+            handle.0,
+            FileAttributeTagInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    }
+    .map_err(win_err)?;
+    Ok((info.FileAttributes, info.ReparseTag))
+}
+
+/// A real directory: not a file, and not a junction/symlink (other reparse
+/// points such as cloud placeholders are ordinary directories).
+fn is_real_dir((attrs, tag): (u32, u32)) -> bool {
+    attrs & ATTR_DIRECTORY != 0 && !(attrs & ATTR_REPARSE_POINT != 0 && is_link_tag(tag))
+}
+
+/// After the security was fixed: returns a handle to the object when it is a
+/// real directory to descend into, `None` for files and links. The tag is
+/// read from the very handle that is returned. That handle has list access
+/// and does not share `DELETE`, so while it is held the directory cannot be
+/// renamed away or replaced by a junction before it is enumerated.
+fn open_dir_to_descend(wide: &[u16]) -> io::Result<Option<FileHandle>> {
+    let list = FILE_LIST_DIRECTORY.0 | FILE_READ_ATTRIBUTES.0;
+    match open_no_follow(wide, list) {
+        Ok(handle) => Ok(is_real_dir(attribute_tag(&handle)?).then_some(handle)),
+        Err(e) => {
+            // Files may refuse data access (locked, exclusive share); classify
+            // with an attributes-only handle and only report real directories.
+            let probe = open_no_follow(wide, FILE_READ_ATTRIBUTES.0)?;
+            if is_real_dir(attribute_tag(&probe)?) {
+                Err(e)
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
 fn take_ownership_entry(path: &Path, admins: &Admins, failures: &mut Vec<(PathBuf, io::Error)>) {
-    let (attrs, tag) = match entry_info(path) {
-        Ok(info) => info,
+    let wide = wide_z(path.as_os_str());
+    if let Err(e) = fix_security(&wide, admins) {
+        failures.push((path.to_path_buf(), e));
+        return;
+    }
+    let dir = match open_dir_to_descend(&wide) {
+        Ok(Some(dir)) => dir,
+        Ok(None) => return,
         Err(e) => {
             failures.push((path.to_path_buf(), e));
             return;
         }
     };
-    let is_dir = attrs & ATTR_DIRECTORY != 0;
-    // Only name-surrogate reparse points (junctions, symlinks) are links.
-    let is_link = attrs & ATTR_REPARSE_POINT != 0 && is_link_tag(tag);
-
-    let owned = set_security(
-        path,
-        is_link,
-        OWNER_SECURITY_INFORMATION,
-        Some(admins.sid()),
-        None,
-    );
-    let granted = owned.and_then(|()| {
-        set_security(
-            path,
-            is_link,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            None,
-            Some(admins.acl.cast_const()),
-        )
-    });
-    if let Err(e) = granted {
-        // Without access this directory cannot be listed either; report once.
-        failures.push((path.to_path_buf(), e));
-        return;
-    }
-
-    if is_dir && !is_link {
-        match std::fs::read_dir(path) {
-            Ok(entries) => {
-                for entry in entries {
-                    match entry {
-                        Ok(entry) => take_ownership_entry(&entry.path(), admins, failures),
-                        Err(e) => failures.push((path.to_path_buf(), e)),
-                    }
+    match std::fs::read_dir(path) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry) => take_ownership_entry(&entry.path(), admins, failures),
+                    Err(e) => failures.push((path.to_path_buf(), e)),
                 }
             }
-            Err(e) => failures.push((path.to_path_buf(), e)),
         }
+        Err(e) => failures.push((path.to_path_buf(), e)),
+    }
+    drop(dir);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn long(s: &str) -> PathBuf {
+        long_path(Path::new(s)).unwrap()
+    }
+
+    #[test]
+    fn long_path_prefixes_and_trims() {
+        assert_eq!(long(r"C:\a\b"), PathBuf::from(r"\\?\C:\a\b"));
+        assert_eq!(long(r"C:\a\b\"), PathBuf::from(r"\\?\C:\a\b"));
+        assert_eq!(long(r"C:\"), PathBuf::from(r"\\?\C:\"));
+        assert_eq!(
+            long(r"\\srv\share\d\"),
+            PathBuf::from(r"\\?\UNC\srv\share\d")
+        );
+    }
+
+    #[test]
+    fn long_path_leaves_verbatim_and_device_paths() {
+        assert_eq!(long(r"\\?\C:\a\"), PathBuf::from(r"\\?\C:\a\"));
+        assert_eq!(long(r"\\.\pipe\x"), PathBuf::from(r"\\.\pipe\x"));
+    }
+
+    #[test]
+    fn long_path_keeps_unpaired_surrogates() {
+        let mut wide: Vec<u16> = r"C:\a\".encode_utf16().collect();
+        wide.push(0xD800);
+        let p = PathBuf::from(OsString::from_wide(&wide));
+        let out: Vec<u16> = long_path(&p).unwrap().as_os_str().encode_wide().collect();
+        assert_eq!(out.last(), Some(&0xD800));
     }
 }
