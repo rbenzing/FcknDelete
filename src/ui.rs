@@ -51,7 +51,7 @@ impl Dialog<'_> {
     fn show(&self) -> i32 {
         let title = wide(TITLE);
         let instruction = self.instruction.map(wide);
-        let content = wide(&wrap_after_backslashes(self.content));
+        let content = wide(&wrap_long_lines(self.content));
         let button_texts: Vec<Vec<u16>> = self
             .buttons
             .iter()
@@ -137,10 +137,29 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
 
-/// Inserts a zero-width space after every `\`, so TaskDialog wraps a long
-/// path at its separators instead of truncating it with an ellipsis.
-fn wrap_after_backslashes(text: &str) -> String {
-    text.replace('\\', "\\\u{200B}")
+/// Longest line TaskDialog content may have before it is hard-wrapped.
+/// TaskDialog ellipsizes (rather than wraps) a single line wider than the
+/// content area, which would hide part of a path in a destructive prompt.
+const WRAP_WIDTH: usize = 48;
+
+/// Hard-wraps every line longer than [`WRAP_WIDTH`] characters by inserting
+/// `\n` right after the last `\` within the first [`WRAP_WIDTH`] characters,
+/// or at [`WRAP_WIDTH`] when there is none. Existing newlines are kept.
+pub(crate) fn wrap_long_lines(text: &str) -> String {
+    let mut out = Vec::new();
+    for line in text.split('\n') {
+        let mut rest: Vec<char> = line.chars().collect();
+        while rest.len() > WRAP_WIDTH {
+            let cut = rest[..WRAP_WIDTH]
+                .iter()
+                .rposition(|&c| c == '\\')
+                .map_or(WRAP_WIDTH, |i| i + 1);
+            out.push(rest[..cut].iter().collect::<String>());
+            rest.drain(..cut);
+        }
+        out.push(rest.into_iter().collect());
+    }
+    out.join("\n")
 }
 
 /// Up to [`MAX_LISTED`] paths, one per line, plus a count of the rest.
@@ -304,5 +323,51 @@ impl Ui for WinUi {
             shield_button: None,
         }
         .show();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn long_path() -> String {
+        let dir = "abcdefghij";
+        let path = format!(r"C:\{}", [dir; 10].join(r"\"));
+        assert!(path.len() >= 100);
+        path
+    }
+
+    #[test]
+    fn long_path_wraps_after_backslashes_within_width() {
+        let path = long_path();
+        let wrapped = wrap_long_lines(&path);
+        let lines: Vec<&str> = wrapped.split('\n').collect();
+        assert!(lines.len() > 1);
+        for line in &lines {
+            assert!(line.chars().count() <= WRAP_WIDTH, "too long: {line}");
+        }
+        for line in &lines[..lines.len() - 1] {
+            assert!(line.ends_with('\\'), "break not after a backslash: {line}");
+        }
+        assert_eq!(wrapped.replace('\n', ""), path);
+    }
+
+    #[test]
+    fn long_run_without_backslash_breaks_at_width() {
+        let text = "x".repeat(WRAP_WIDTH * 2 + 5);
+        let wrapped = wrap_long_lines(&text);
+        let lens: Vec<usize> = wrapped.split('\n').map(|l| l.chars().count()).collect();
+        assert_eq!(lens, vec![WRAP_WIDTH, WRAP_WIDTH, 5]);
+        assert_eq!(wrapped.replace('\n', ""), text);
+    }
+
+    #[test]
+    fn short_lines_and_existing_newlines_are_preserved() {
+        let text = "C:\\short\n\nIt skips the Recycle Bin.";
+        assert_eq!(wrap_long_lines(text), text);
+        let mixed = format!("first\n{}\nlast", long_path());
+        let wrapped = wrap_long_lines(&mixed);
+        assert!(wrapped.starts_with("first\n") && wrapped.ends_with("\nlast"));
+        assert_eq!(wrapped.replace('\n', ""), mixed.replace('\n', ""));
     }
 }
