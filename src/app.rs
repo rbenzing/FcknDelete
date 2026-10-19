@@ -79,7 +79,7 @@ fn run_menu(ui: &mut dyn Ui, sys: &mut dyn System) -> i32 {
     };
     let paths = [path];
     match delete_flow(&paths, true, ui, sys) {
-        Flow::Deleted => {
+        Flow::Deleted | Flow::Elevated(0) => {
             ui.info(&format!("Fckn deleted:\n{}", paths[0].display()));
             0
         }
@@ -121,12 +121,14 @@ enum Flow {
     Deleted,
     /// The run is over with this exit code (errors already shown).
     Exit(i32),
+    /// The elevated copy did the work and reported this exit code.
+    Elevated(i32),
 }
 
 fn exit_code(flow: Flow) -> i32 {
     match flow {
         Flow::Cancelled | Flow::Deleted => 0,
-        Flow::Exit(code) => code,
+        Flow::Exit(code) | Flow::Elevated(code) => code,
     }
 }
 
@@ -182,8 +184,8 @@ fn delete_flow(paths: &[PathBuf], confirm: bool, ui: &mut dyn Ui, sys: &mut dyn 
 
     let mut targets: Vec<Target> = paths.iter().map(|p| Target::attempt(p)).collect();
     close_lockers(&mut targets, ui, sys);
-    if let Some(code) = resolve_access_denied(&mut targets, paths, ui, sys) {
-        return Flow::Exit(code);
+    if let Some(flow) = resolve_access_denied(&mut targets, paths, ui, sys) {
+        return flow;
     }
     report(&targets, ui)
 }
@@ -195,7 +197,8 @@ fn close_lockers(targets: &mut [Target], ui: &mut dyn Ui, sys: &mut dyn System) 
         .iter()
         .flat_map(Target::failures)
         .filter(|f| f.is_locked())
-        .map(|f| f.path.clone())
+        // Restart Manager may not match `\\?\` verbatim paths.
+        .map(|f| PathBuf::from(display_path(&f.path)))
         .collect();
     if locked.is_empty() {
         return;
@@ -218,13 +221,13 @@ fn close_lockers(targets: &mut [Target], ui: &mut dyn Ui, sys: &mut dyn System) 
 
 /// Handles items that still fail with "access denied": takes ownership
 /// in-process when already elevated, otherwise offers a UAC relaunch.
-/// Returns the exit code when the run is finished by a relaunch attempt.
+/// Returns the outcome when the run is finished by a relaunch attempt.
 fn resolve_access_denied(
     targets: &mut [Target],
     roots: &[PathBuf],
     ui: &mut dyn Ui,
     sys: &mut dyn System,
-) -> Option<i32> {
+) -> Option<Flow> {
     if !targets
         .iter()
         .any(|t| t.has_failure(Failure::is_access_denied))
@@ -262,14 +265,14 @@ fn resolve_access_denied(
     }
     match sys.relaunch_elevated(&existing) {
         // The elevated child reports its own errors.
-        Ok(code) => Some(code),
+        Ok(code) => Some(Flow::Elevated(code)),
         Err(e) if e.raw_os_error() == Some(ERROR_CANCELLED) => {
             ui.error("Admin permission was declined.");
-            Some(1)
+            Some(Flow::Exit(1))
         }
         Err(e) => {
             ui.error(&format!("Couldn't restart with admin rights:\n{e}"));
-            Some(1)
+            Some(Flow::Exit(1))
         }
     }
 }

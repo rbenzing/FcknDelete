@@ -94,12 +94,15 @@ struct FakeSystem {
     elevated: bool,
     lockers: Vec<LockingProcess>,
     held: Option<File>,
+    /// Whether `kill` releases `held` (a stubborn process does not).
+    kill_frees_file: bool,
     /// Raw OS error to fail `relaunch_elevated` with, else exit code 0.
     relaunch_error: Option<i32>,
 
     installs: u32,
     uninstalls: u32,
     killed: Vec<u32>,
+    locker_queries: Vec<Vec<PathBuf>>,
     relaunches: Vec<Vec<PathBuf>>,
     ownership: Vec<PathBuf>,
 }
@@ -111,10 +114,12 @@ impl FakeSystem {
             elevated: false,
             lockers: Vec::new(),
             held: None,
+            kill_frees_file: true,
             relaunch_error: None,
             installs: 0,
             uninstalls: 0,
             killed: Vec::new(),
+            locker_queries: Vec::new(),
             relaunches: Vec::new(),
             ownership: Vec::new(),
         }
@@ -133,12 +138,15 @@ impl System for FakeSystem {
         self.uninstalls += 1;
         Ok(())
     }
-    fn find_lockers(&mut self, _paths: &[PathBuf]) -> Vec<LockingProcess> {
+    fn find_lockers(&mut self, paths: &[PathBuf]) -> Vec<LockingProcess> {
+        self.locker_queries.push(paths.to_vec());
         self.lockers.clone()
     }
     fn kill(&mut self, pid: u32) -> io::Result<()> {
         self.killed.push(pid);
-        self.held = None;
+        if self.kill_frees_file {
+            self.held = None;
+        }
         Ok(())
     }
     fn is_elevated(&self) -> bool {
@@ -346,6 +354,14 @@ fn locked_file_kill_then_delete() {
     assert_eq!(sys.killed, vec![42]);
     assert!(sys.held.is_none());
     assert!(!f.exists());
+    // Restart Manager needs plain paths, not the `\\?\` form force_delete reports.
+    assert_eq!(sys.locker_queries.len(), 1);
+    assert!(!sys.locker_queries[0].is_empty());
+    assert!(
+        sys.locker_queries[0]
+            .iter()
+            .all(|p| !p.to_string_lossy().starts_with(r"\\?\"))
+    );
     assert_eq!(ui.kill_calls, vec![vec![locker]]);
     assert!(ui.errors.is_empty());
 }
@@ -689,5 +705,66 @@ fn install_failure_shows_error() {
     assert_eq!(ui.errors.len(), 2);
     assert!(ui.errors[0].contains("boom"));
     assert!(ui.errors[1].contains("bang"));
+    assert!(ui.infos.is_empty());
+}
+
+#[test]
+fn kill_that_does_not_free_file_retries_once_then_errors() {
+    let (_dir, f) = temp_file();
+    let mut ui = FakeUi::new();
+    ui.confirm_kill = true;
+    let mut sys = FakeSystem::new();
+    sys.kill_frees_file = false;
+    sys.held = Some(
+        OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&f)
+            .unwrap(),
+    );
+    sys.lockers = vec![LockingProcess {
+        pid: 42,
+        name: "x".to_string(),
+    }];
+    assert_eq!(run(Command::Delete(vec![f.clone()]), &mut ui, &mut sys), 1);
+    assert_eq!(sys.killed, vec![42]);
+    assert_eq!(sys.locker_queries.len(), 1);
+    assert_eq!(ui.kill_calls.len(), 1);
+    assert!(f.exists());
+    assert_eq!(ui.errors.len(), 1);
+    assert!(ui.errors[0].starts_with("Couldn't delete:"));
+}
+
+#[test]
+fn one_protected_path_makes_warning_cover_all_paths() {
+    let (_dir, f) = temp_file();
+    let paths = vec![f.clone(), PathBuf::from(r"C:\")];
+    let mut ui = FakeUi::new();
+    ui.confirm_protected = false;
+    let mut sys = FakeSystem::new();
+    assert_eq!(run(Command::Delete(paths.clone()), &mut ui, &mut sys), 0);
+    assert_eq!(ui.protected_calls, vec![paths]);
+    assert!(ui.delete_calls.is_empty());
+    assert!(f.exists());
+}
+
+#[test]
+fn menu_relaunch_success_shows_info_but_delete_mode_is_silent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _file, _guard) = denied_file(dir.path());
+
+    let mut ui = FakeUi::new();
+    ui.menu = MenuChoice::PickFolder;
+    ui.folder = Some(root.clone());
+    ui.confirm_elevate = true;
+    let mut sys = FakeSystem::new();
+    assert_eq!(run(Command::Menu, &mut ui, &mut sys), 0);
+    assert_eq!(sys.relaunches.len(), 1);
+    assert_eq!(ui.infos, vec![format!("Fckn deleted:\n{}", root.display())]);
+
+    let mut ui = FakeUi::new();
+    ui.confirm_elevate = true;
+    assert_eq!(run(Command::Delete(vec![root]), &mut ui, &mut sys), 0);
+    assert_eq!(sys.relaunches.len(), 2);
     assert!(ui.infos.is_empty());
 }
