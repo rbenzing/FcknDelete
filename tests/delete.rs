@@ -1,4 +1,7 @@
-use fckn_delete::delete::{DeleteError, force_delete, is_protected};
+use fckn_delete::delete::{
+    DeleteError, REPARSE_TAG_MOUNT_POINT, REPARSE_TAG_SYMLINK, force_delete, is_link_tag,
+    is_protected,
+};
 use std::fs::{self, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -95,6 +98,30 @@ fn junction_target_survives() {
 }
 
 #[test]
+fn only_name_surrogate_tags_are_links() {
+    assert!(is_link_tag(REPARSE_TAG_MOUNT_POINT));
+    assert!(is_link_tag(REPARSE_TAG_SYMLINK));
+    assert!(!is_link_tag(0x9000_001A)); // IO_REPARSE_TAG_CLOUD (OneDrive placeholders)
+    assert!(!is_link_tag(0x8000_0013)); // IO_REPARSE_TAG_DEDUP
+}
+
+#[test]
+fn symlink_dir_target_survives_when_creatable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("keep.txt"), "keep").unwrap();
+    let root = tmp.path().join("root");
+    fs::create_dir(&root).unwrap();
+    if std::os::windows::fs::symlink_dir(&outside, root.join("link")).is_err() {
+        return; // symlink creation needs privilege / developer mode
+    }
+    force_delete(&root).unwrap();
+    assert!(!root.exists());
+    assert!(outside.join("keep.txt").exists());
+}
+
+#[test]
 fn missing_path_is_not_found() {
     let tmp = tempfile::tempdir().unwrap();
     let r = force_delete(&tmp.path().join("nope"));
@@ -120,6 +147,7 @@ fn protected_paths_detected() {
 fn protected_works_for_nonexistent_paths() {
     assert!(is_protected(Path::new(r"\\?\C:\")));
     assert!(is_protected(Path::new(r"c:\USERS\")));
+    assert!(is_protected(Path::new(r"Q:\"))); // drive root, even if absent or mapped
     assert!(is_protected(Path::new(r"C:\Windows\DoesNotExist\..\")));
     assert!(is_protected(Path::new(r"c:\windows\no\such\thing")));
     assert!(!is_protected(Path::new(r"C:\definitely\not\a\real\folder")));

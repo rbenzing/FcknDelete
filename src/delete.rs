@@ -7,7 +7,9 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, SetFileAttributesW};
+use windows::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_NORMAL, FindClose, FindFirstFileW, SetFileAttributesW, WIN32_FIND_DATAW,
+};
 use windows::core::PCWSTR;
 
 const ATTR_READONLY: u32 = 0x1;
@@ -131,7 +133,12 @@ fn delete_entry(path: &Path, failures: &mut Vec<Failure>) {
 
     let is_dir = attrs & ATTR_DIRECTORY != 0;
     let failures_before = failures.len();
-    let result = if attrs & ATTR_REPARSE_POINT != 0 {
+    // Only name-surrogate reparse points (junctions, symlinks) are links.
+    // Other reparse points (cloud placeholders, dedup, ...) are real
+    // files/directories and are handled normally. If the tag cannot be read,
+    // assume a link: never descending is the safe direction.
+    let is_link = attrs & ATTR_REPARSE_POINT != 0 && reparse_tag(path).is_none_or(is_link_tag);
+    let result = if is_link {
         // Link: remove the link itself, never descend into its target.
         if is_dir {
             fs::remove_dir(path)
@@ -183,6 +190,32 @@ fn delete_dir_contents(path: &Path, failures: &mut Vec<Failure>) {
     }
 }
 
+/// `IO_REPARSE_TAG_MOUNT_POINT` (junction).
+pub const REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+/// `IO_REPARSE_TAG_SYMLINK`.
+pub const REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+/// Bit 29 marks a "name surrogate" tag: the entry stands in for another
+/// file system object (`IsReparseTagNameSurrogate`).
+const REPARSE_TAG_NAME_SURROGATE_BIT: u32 = 0x2000_0000;
+
+/// True when a reparse tag denotes a link to another object (junction,
+/// symlink) rather than a real file/directory with special storage.
+pub fn is_link_tag(tag: u32) -> bool {
+    tag & REPARSE_TAG_NAME_SURROGATE_BIT != 0
+}
+
+/// Reparse tag of `path` itself (not its target), or `None` if unreadable.
+fn reparse_tag(path: &Path) -> Option<u32> {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut data = WIN32_FIND_DATAW::default();
+    // SAFETY: `wide` is NUL-terminated and `data` is a valid out buffer.
+    let handle = unsafe { FindFirstFileW(PCWSTR(wide.as_ptr()), &mut data) }.ok()?;
+    // SAFETY: `handle` was returned by FindFirstFileW above.
+    let _ = unsafe { FindClose(handle) };
+    // dwReserved0 holds the reparse tag when the reparse attribute is set.
+    (data.dwFileAttributes & ATTR_REPARSE_POINT != 0).then_some(data.dwReserved0)
+}
+
 /// Best effort: a failure here surfaces as the delete error that follows.
 fn clear_attributes(path: &Path, attrs: u32) {
     if attrs & (ATTR_READONLY | ATTR_HIDDEN | ATTR_SYSTEM) == 0 {
@@ -203,10 +236,16 @@ fn normalize(path: &Path) -> Vec<String> {
     } else {
         None
     };
-    let base = match resolved {
-        Some(p) => p,
-        None if path.is_absolute() => path.to_path_buf(),
-        None => std::env::current_dir().map_or_else(|_| path.to_path_buf(), |d| d.join(path)),
+    lexical(&resolved.unwrap_or_else(|| path.to_path_buf()))
+}
+
+/// Purely lexical segments of `path` (made absolute against the current
+/// directory if needed).
+fn lexical(path: &Path) -> Vec<String> {
+    let base = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |d| d.join(path))
     };
 
     let text = base.to_string_lossy().replace('/', "\\");
@@ -252,7 +291,9 @@ pub fn is_protected(path: &Path) -> bool {
     if target.is_empty() {
         return false;
     }
-    if is_drive_root(&target) {
+    // Also check the lexical form: a mapped drive (`Z:\`) resolves to a UNC
+    // share path, which would otherwise hide that it is a drive root.
+    if is_drive_root(&target) || is_drive_root(&lexical(path)) {
         return true;
     }
 
