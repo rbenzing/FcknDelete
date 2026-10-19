@@ -38,8 +38,12 @@ fn command_line_quotes_exe_and_arg() {
         r#""C:\Prog Files\FcknDelete.exe" "%1""#
     );
     assert_eq!(
-        command_line(Path::new(r"\?\C:\x\FcknDelete.exe")),
+        command_line(Path::new(r"\\?\C:\x\FcknDelete.exe")),
         r#""C:\x\FcknDelete.exe" "%1""#
+    );
+    assert_eq!(
+        command_line(Path::new(r"\\?\UNC\srv\share\FcknDelete.exe")),
+        r#""\\srv\share\FcknDelete.exe" "%1""#
     );
 }
 

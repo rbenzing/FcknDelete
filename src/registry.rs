@@ -17,10 +17,15 @@ const INSTALLED_EXE_NAME: &str = "FcknDelete.exe";
 /// Class keys the verb is attached to: every file, and every folder.
 const TARGETS: [&str; 2] = ["*", "Directory"];
 
-/// The shell command for the verb: `"<exe>" "%1"`. A `\?\` prefix on `exe` is stripped.
+/// The shell command for the verb: `"<exe>" "%1"`. A verbatim `\\?\` prefix on `exe` is
+/// stripped (`\\?\UNC\server\share` becomes `\\server\share`).
 pub fn command_line(exe: &Path) -> String {
     let exe = exe.to_string_lossy();
-    let exe = exe.strip_prefix(r"\?\").unwrap_or(&exe);
+    let exe = if let Some(unc) = exe.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        exe.strip_prefix(r"\\?\").unwrap_or(&exe).to_owned()
+    };
     format!("\"{exe}\" \"%1\"")
 }
 
@@ -94,10 +99,14 @@ fn is_same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// `%LOCALAPPDATA%\Programs\FcknDelete`.
+/// `%LOCALAPPDATA%\Programs\FcknDelete`, or `%USERPROFILE%\AppData\Local\Programs\FcknDelete`
+/// when `LOCALAPPDATA` is unset.
 pub fn default_install_dir() -> PathBuf {
     let base = env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir);
+        .unwrap_or_else(|| {
+            let profile = env::var_os("USERPROFILE").map(PathBuf::from);
+            profile.unwrap_or_default().join("AppData").join("Local")
+        });
     base.join("Programs").join("FcknDelete")
 }
