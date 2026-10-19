@@ -51,7 +51,7 @@ impl Dialog<'_> {
     fn show(&self) -> i32 {
         let title = wide(TITLE);
         let instruction = self.instruction.map(wide);
-        let content = wide(&wrap_long_lines(self.content));
+        let content = wide(&wrap_long_tokens(self.content));
         let button_texts: Vec<Vec<u16>> = self
             .buttons
             .iter()
@@ -137,29 +137,44 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
 
-/// Longest line TaskDialog content may have before it is hard-wrapped.
-/// TaskDialog ellipsizes (rather than wraps) a single line wider than the
-/// content area, which would hide part of a path in a destructive prompt.
+/// Longest whitespace-free token TaskDialog content may have before it is
+/// hard-wrapped. TaskDialog word-wraps prose, but it ellipsizes a single
+/// unbreakable run wider than the content area, which would hide part of a
+/// path in a destructive prompt.
 const WRAP_WIDTH: usize = 48;
 
-/// Hard-wraps every line longer than [`WRAP_WIDTH`] characters by inserting
-/// `\n` right after the last `\` within the first [`WRAP_WIDTH`] characters,
-/// or at [`WRAP_WIDTH`] when there is none. Existing newlines are kept.
-pub(crate) fn wrap_long_lines(text: &str) -> String {
-    let mut out = Vec::new();
-    for line in text.split('\n') {
-        let mut rest: Vec<char> = line.chars().collect();
-        while rest.len() > WRAP_WIDTH {
-            let cut = rest[..WRAP_WIDTH]
-                .iter()
-                .rposition(|&c| c == '\\')
-                .map_or(WRAP_WIDTH, |i| i + 1);
-            out.push(rest[..cut].iter().collect::<String>());
-            rest.drain(..cut);
+/// Hard-wraps every whitespace-free token longer than [`WRAP_WIDTH`]
+/// characters by inserting `\n` right after the last `\` within the first
+/// [`WRAP_WIDTH`] characters, or at [`WRAP_WIDTH`] when there is none. All
+/// whitespace and shorter tokens are kept as they are, so prose still
+/// word-wraps naturally.
+pub(crate) fn wrap_long_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut token: Vec<char> = Vec::new();
+    for c in text.chars() {
+        if c.is_whitespace() {
+            push_wrapped(&mut out, &mut token);
+            out.push(c);
+        } else {
+            token.push(c);
         }
-        out.push(rest.into_iter().collect());
     }
-    out.join("\n")
+    push_wrapped(&mut out, &mut token);
+    out
+}
+
+/// Appends `token` to `out`, breaking it as [`wrap_long_tokens`] describes,
+/// and empties it.
+fn push_wrapped(out: &mut String, token: &mut Vec<char>) {
+    while token.len() > WRAP_WIDTH {
+        let cut = token[..WRAP_WIDTH]
+            .iter()
+            .rposition(|&c| c == '\\')
+            .map_or(WRAP_WIDTH, |i| i + 1);
+        out.extend(token.drain(..cut));
+        out.push('\n');
+    }
+    out.extend(token.drain(..));
 }
 
 /// Up to [`MAX_LISTED`] paths, one per line, plus a count of the rest.
@@ -340,7 +355,7 @@ mod tests {
     #[test]
     fn long_path_wraps_after_backslashes_within_width() {
         let path = long_path();
-        let wrapped = wrap_long_lines(&path);
+        let wrapped = wrap_long_tokens(&path);
         let lines: Vec<&str> = wrapped.split('\n').collect();
         assert!(lines.len() > 1);
         for line in &lines {
@@ -355,7 +370,7 @@ mod tests {
     #[test]
     fn long_run_without_backslash_breaks_at_width() {
         let text = "x".repeat(WRAP_WIDTH * 2 + 5);
-        let wrapped = wrap_long_lines(&text);
+        let wrapped = wrap_long_tokens(&text);
         let lens: Vec<usize> = wrapped.split('\n').map(|l| l.chars().count()).collect();
         assert_eq!(lens, vec![WRAP_WIDTH, WRAP_WIDTH, 5]);
         assert_eq!(wrapped.replace('\n', ""), text);
@@ -364,10 +379,33 @@ mod tests {
     #[test]
     fn short_lines_and_existing_newlines_are_preserved() {
         let text = "C:\\short\n\nIt skips the Recycle Bin.";
-        assert_eq!(wrap_long_lines(text), text);
+        assert_eq!(wrap_long_tokens(text), text);
         let mixed = format!("first\n{}\nlast", long_path());
-        let wrapped = wrap_long_lines(&mixed);
+        let wrapped = wrap_long_tokens(&mixed);
         assert!(wrapped.starts_with("first\n") && wrapped.ends_with("\nlast"));
         assert_eq!(wrapped.replace('\n', ""), mixed.replace('\n', ""));
+    }
+
+    #[test]
+    fn long_prose_is_left_for_taskdialog_to_word_wrap() {
+        let prose = "Deleting this can break Windows or your apps, and it can't be undone. \
+                     Only continue if you're absolutely sure.";
+        assert!(prose.chars().count() > WRAP_WIDTH);
+        assert_eq!(wrap_long_tokens(prose), prose);
+    }
+
+    #[test]
+    fn only_the_long_path_token_is_broken_inside_a_line() {
+        let path = long_path();
+        let line = format!("{path} \u{2014} Access is denied.");
+        let wrapped = wrap_long_tokens(&line);
+        assert!(
+            wrapped.ends_with(" \u{2014} Access is denied."),
+            "text after the path changed: {wrapped}"
+        );
+        let path_part = wrapped.strip_suffix(" \u{2014} Access is denied.").unwrap();
+        assert_eq!(path_part, wrap_long_tokens(&path));
+        assert!(path_part.contains('\n'));
+        assert_eq!(wrapped.replace('\n', ""), line);
     }
 }
