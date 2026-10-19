@@ -312,7 +312,7 @@ fn report(targets: &[Target], ui: &mut dyn Ui) -> Flow {
 }
 
 /// `path` without the `\\?\` verbatim prefix `force_delete` adds.
-fn display_path(path: &Path) -> String {
+pub fn display_path(path: &Path) -> String {
     let text = path.to_string_lossy();
     if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{unc}")

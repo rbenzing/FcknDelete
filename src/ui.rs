@@ -1,6 +1,6 @@
 //! Real Windows dialogs behind the [`Ui`] trait: TaskDialogs plus `rfd` pickers.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Controls::{
@@ -12,7 +12,8 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::WindowsAndMessaging::{IDCANCEL, SendMessageW};
 use windows::core::{HRESULT, PCWSTR};
 
-use crate::app::{MenuChoice, Ui};
+use crate::app::{MenuChoice, Ui, display_path};
+use crate::delete::is_protected;
 use crate::locks::LockingProcess;
 
 const TITLE: &str = "Fckn Delete";
@@ -50,8 +51,13 @@ impl Dialog<'_> {
     fn show(&self) -> i32 {
         let title = wide(TITLE);
         let instruction = self.instruction.map(wide);
-        let content = wide(self.content);
-        let button_texts: Vec<Vec<u16>> = self.buttons.iter().map(|(_, t)| wide(t)).collect();
+        let content = wide(&wrap_after_backslashes(self.content));
+        let button_texts: Vec<Vec<u16>> = self
+            .buttons
+            .iter()
+            // `&` marks a mnemonic in button text; `&&` shows a literal one.
+            .map(|(_, t)| wide(&t.replace('&', "&&")))
+            .collect();
         let buttons: Vec<TASKDIALOG_BUTTON> = self
             .buttons
             .iter()
@@ -131,14 +137,10 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
 
-/// `path` without a `\\?\` verbatim prefix.
-fn display_path(path: &Path) -> String {
-    let text = path.to_string_lossy();
-    if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{unc}")
-    } else {
-        text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
-    }
+/// Inserts a zero-width space after every `\`, so TaskDialog wraps a long
+/// path at its separators instead of truncating it with an ellipsis.
+fn wrap_after_backslashes(text: &str) -> String {
+    text.replace('\\', "\\\u{200B}")
 }
 
 /// Up to [`MAX_LISTED`] paths, one per line, plus a count of the rest.
@@ -232,10 +234,13 @@ impl Ui for WinUi {
     }
 
     fn confirm_protected(&mut self, paths: &[PathBuf]) -> bool {
+        // Protected paths first, so the list's cut-off never hides them.
+        let mut ordered = paths.to_vec();
+        ordered.sort_by_key(|p| !is_protected(p));
         let content = format!(
             "{}\n\nDeleting this can break Windows or your apps, and it can't be undone. \
              Only continue if you're absolutely sure.",
-            path_list(paths)
+            path_list(&ordered)
         );
         confirm(
             TD_ERROR_ICON,

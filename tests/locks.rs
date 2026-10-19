@@ -103,6 +103,7 @@ fn kill_terminates_child_locker() {
     }
 
     kill(child_pid).unwrap();
-    child.0.wait().unwrap();
+    // `kill` must not return before the process released its handles.
     std::fs::remove_file(&file).unwrap();
+    child.0.wait().unwrap();
 }

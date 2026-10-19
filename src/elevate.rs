@@ -123,7 +123,7 @@ fn wide_z(s: &OsStr) -> Vec<u16> {
 /// Converts a `windows` error into an `io::Error` carrying the plain Win32
 /// code (`raw_os_error() == Some(5)` for access denied). The crate's own
 /// `From` impl would keep the `0x8007xxxx` HRESULT form.
-fn win_err(e: windows::core::Error) -> io::Error {
+pub(crate) fn win_err(e: windows::core::Error) -> io::Error {
     let code = e.code().0 as u32;
     if code & 0xFFFF_0000 == 0x8007_0000 {
         io::Error::from_raw_os_error((code & 0xFFFF) as i32)

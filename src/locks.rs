@@ -11,8 +11,15 @@ use windows::Win32::System::RestartManager::{
     CCH_RM_SESSION_KEY, RM_PROCESS_INFO, RmCritical, RmEndSession, RmGetList, RmRegisterResources,
     RmStartSession,
 };
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+};
 use windows::core::{PCWSTR, PWSTR};
+
+use crate::elevate::win_err;
+
+/// How long `kill` waits for a terminated process to exit.
+const EXIT_WAIT_MS: u32 = 5000;
 
 /// A process that currently holds one of the queried files open.
 #[derive(Debug, Clone, PartialEq)]
@@ -152,9 +159,13 @@ pub fn kill(pid: u32) -> io::Result<()> {
     // SAFETY: plain Win32 calls; the handle is owned and closed by the guard.
     unsafe {
         let handle = OwnedHandle(
-            OpenProcess(PROCESS_TERMINATE, false, pid)
-                .map_err(|e| io::Error::from_raw_os_error(e.code().0 & 0xFFFF))?,
+            OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, false, pid).map_err(win_err)?,
         );
-        TerminateProcess(handle.0, 1).map_err(|e| io::Error::from_raw_os_error(e.code().0 & 0xFFFF))
+        TerminateProcess(handle.0, 1).map_err(win_err)?;
+        // Termination is asynchronous and the process's file handles are only
+        // released once it has fully exited. A timeout is not an error: the
+        // caller's retry reports anything that is still locked.
+        WaitForSingleObject(handle.0, EXIT_WAIT_MS);
     }
+    Ok(())
 }
