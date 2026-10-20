@@ -8,7 +8,7 @@
 
 </div>
 
-**A small Windows tool that force-deletes files and folders when Explorer says no.**
+**A small Windows tool for File Controlling, Killing and Nix'ing files and folders when Explorer says no.**
 
 This utility is built for the cases where normal delete behavior gets blocked by locked files, read-only attributes, long paths, protected folders, or stubborn Explorer permission checks. It is fast, explicit, and designed to make the dangerous operation obvious before it runs.
 
