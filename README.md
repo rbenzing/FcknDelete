@@ -5,14 +5,22 @@
 [![Rust](https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Windows](https://img.shields.io/badge/Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 [![Build](https://img.shields.io/badge/Build-Release-orange?style=for-the-badge)](#build)
+[![Release](https://img.shields.io/github/v/release/rbenzing/FcknDelete?style=for-the-badge)](https://github.com/rbenzing/FcknDelete/releases/latest)
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/russellbenzing)
+
+**A small Windows tool for force-removing stubborn locked, read-only, and path-hostile files and folders**
+
+⚙️ **Force delete** • 🧹 **Protected item handling** • 🪟 **Explorer integration** • 🦀 **Rust**
+
+[Features](#-features) • [Build](#-build) • [Use](#-use) • [Command Line](#-command-line) • [Uninstall](#-uninstall)
 
 </div>
 
-**A small Windows tool for File Controlling, Killing and Nix'ing files and folders when Explorer says no.**
+---
 
-This utility is built for the cases where normal delete behavior gets blocked by locked files, read-only attributes, long paths, protected folders, or stubborn Explorer permission checks. It is fast, explicit, and designed to make the dangerous operation obvious before it runs.
+**Fckn Delete** is a Windows utility built for the cases where normal delete behavior gets blocked by locked files, read-only attributes, long paths, protected folders, or stubborn Explorer permission checks.
 
-[Features](#-features) • [Build](#-build) • [Use](#-use) • [Command Line](#-command-line) • [Uninstall](#-uninstall)
+> When Explorer says “no,” FcknDelete says “challenge accepted.”
 
 ---
 
@@ -109,3 +117,15 @@ This removes the registry entries only. If you want to remove the copied executa
 This tool is intentionally aggressive. It is meant for cases where ordinary delete behavior fails, but it still performs a strong confirmation step before acting on dangerous or protected locations.
 
 Use it carefully and only when you understand exactly what you are deleting.
+
+---
+
+## ❤️ Support
+
+If FcknDelete is useful to you, you can support the work:
+
+<div align="center">
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/russellbenzing)
+
+</div>
