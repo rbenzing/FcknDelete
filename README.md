@@ -1,43 +1,111 @@
 # Fckn Delete
 
-A small Windows tool that force-deletes files and folders when Explorer says no.
+<div align="center">
 
-- Permanent delete (skips the Recycle Bin), recursive, handles read-only/hidden/system items and paths longer than 260 characters.
-- Never follows junctions or symlinks: only the link itself is removed.
-- If something is locked, it shows which programs are using it and can close them for you.
-- If something needs admin rights, it can take ownership via UAC and then delete it.
-- Extra-loud warning before touching protected locations (drive roots, your profile, Windows, Program Files, ProgramData).
+[![Rust](https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Windows](https://img.shields.io/badge/Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://www.microsoft.com/windows)
+[![Build](https://img.shields.io/badge/Build-Release-orange?style=for-the-badge)](#build)
 
-## Build
+</div>
 
-```
+**A small Windows tool that force-deletes files and folders when Explorer says no.**
+
+This utility is built for the cases where normal delete behavior gets blocked by locked files, read-only attributes, long paths, protected folders, or stubborn Explorer permission checks. It is fast, explicit, and designed to make the dangerous operation obvious before it runs.
+
+[Features](#-features) • [Build](#-build) • [Use](#-use) • [Command Line](#-command-line) • [Uninstall](#-uninstall)
+
+---
+
+## ✨ Features
+
+- **🧹 Permanent delete** — skips the Recycle Bin and removes files/folders recursively
+- **🔒 Handles protected items** — works through read-only, hidden, and system files
+- **📏 Long path support** — can operate on paths longer than 260 characters
+- **🛡️ Safe by default** — never follows junctions or symlinks; only the link itself is removed
+- **🔍 Locked-file detection** — identifies which programs are using a file or folder
+- **🪟 Optional takeover** — can close locks or request admin rights to take ownership when needed
+- **⚠️ Extra warning layer** — warns before touching protected locations such as drive roots, your profile, Windows, Program Files, or ProgramData
+- **📁 Explorer integration** — add/remove a right-click entry for quick access from File Explorer
+
+---
+
+## 🏗️ Build
+
+Requires:
+
+- Windows
+- Rust toolchain (`cargo`)
+
+```bash
 cargo build --release
 ```
 
-The result is `target\release\FcknDelete.exe`. It is a single self-contained exe (Windows only).
+The output is:
 
-## Use
+```text
+target\release\FcknDelete.exe
+```
 
-Double-click `FcknDelete.exe` to get a menu: pick a file, pick a folder, or add/remove the right-click entry.
+This produces a single self-contained Windows executable.
+
+---
+
+## 🚀 Use
+
+Double-click `FcknDelete.exe` to launch the app. From there you can:
+
+- delete a file
+- delete a folder
+- add/remove the right-click menu entry
 
 ### Right-click menu
 
-Double-click the exe and choose **Add "Fckn Delete" to the right-click menu**. This copies the exe to `%LOCALAPPDATA%\Programs\FcknDelete\` and registers a `Fckn Delete` entry for files and folders under your user account (no admin needed). You can also run `FcknDelete.exe --install`.
+To add the command to Explorer:
 
-On Windows 11 the entry lives under **Show more options** (or press Shift+F10) in the right-click menu; the new top-level menu needs a packaged shell extension, which this tool does not provide.
+1. Run `FcknDelete.exe`
+2. Choose **Add "Fckn Delete" to the right-click menu**
+3. The program copies itself to:
+   `%LOCALAPPDATA%\Programs\FcknDelete\`
+4. A `Fckn Delete` entry is registered for files and folders
 
-When you select several items, Explorer starts one Fckn Delete per item, so you get one confirmation each.
+On Windows 11, the entry appears under **Show more options** (or by pressing `Shift+F10`). The new top-level menu requires a packaged shell extension, which this tool does not provide.
 
-### Command line
+When multiple items are selected, Explorer launches one instance per item, so each selection gets its own confirmation prompt.
 
-```
+---
+
+## 💻 Command line
+
+```text
 FcknDelete.exe <path> [<path> ...]   delete the given paths (with confirmation)
 FcknDelete.exe --install             add the right-click entry
 FcknDelete.exe --uninstall           remove the right-click entry
 ```
 
-Exit code is `0` on success or cancel, `1` on failure.
+Exit codes:
 
-## Uninstall
+- `0` — success or user canceled
+- `1` — failure
 
-Double-click the exe and choose **Remove "Fckn Delete" from the right-click menu** (or run `FcknDelete.exe --uninstall`). This removes the registry entries only; delete `%LOCALAPPDATA%\Programs\FcknDelete\` yourself if you want the copied exe gone (use Fckn Delete, naturally).
+---
+
+## 🧹 Uninstall
+
+You can remove the Explorer integration either by:
+
+- launching the app and choosing **Remove "Fckn Delete" from the right-click menu**, or
+- running:
+
+```bash
+FcknDelete.exe --uninstall
+```
+
+This removes the registry entries only. If you want to remove the copied executable from `%LOCALAPPDATA%\Programs\FcknDelete\`, delete that folder manually.
+
+---
+
+## ⚠️ Safety notes
+
+This tool is intentionally aggressive. It is meant for cases where ordinary delete behavior fails, but it still performs a strong confirmation step before acting on dangerous or protected locations.
+
+Use it carefully and only when you understand exactly what you are deleting.
